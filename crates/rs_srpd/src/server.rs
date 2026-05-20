@@ -1,11 +1,11 @@
-//! Relay server: accept encrypted tunnels and forward TCP and UDP traffic.
+//! Relay server: accept encrypted tunnels over TCP / QUIC / WSS and forward
+//! TCP and UDP traffic.
 //!
-//! For each client tunnel the server runs the Noise responder handshake, wraps
-//! the session in yamux, authenticates the client on the control substream,
-//! and binds a public port for every registered proxy. A TCP proxy gets a
-//! `TcpListener`; a UDP proxy gets a `UdpSocket` whose datagrams are demuxed by
-//! source address. Either way, traffic flows over per-connection data
-//! substreams back to the client.
+//! Every enabled transport gets its own accept loop; each accepted byte stream
+//! — whatever the transport — runs the same Noise + yamux + control-protocol
+//! stack. A TCP proxy binds a public `TcpListener`; a UDP proxy binds a
+//! `UdpSocket` demultiplexed by source address. Traffic flows over
+//! per-connection data substreams back to the client.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::io::{copy_bidirectional, split, ReadHalf, WriteHalf};
+use tokio::io::{copy_bidirectional, split, AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -25,8 +25,10 @@ use srp_core::mux::{Mux, Substream};
 use srp_core::proto::{
     read_datagram, read_frame, write_datagram, write_frame, ControlMsg, DataHead,
 };
+use srp_core::quic::QuicListener;
 use srp_core::session;
 use srp_core::types::ProxyKind;
+use srp_core::wss::WssListener;
 
 use crate::config::{self, ServerConfig, User};
 
@@ -48,44 +50,127 @@ pub async fn run(config_path: &Path) -> Result<()> {
         "server identity ready"
     );
 
-    let tcp = config
-        .transports
-        .tcp
-        .as_ref()
-        .filter(|t| t.enabled)
-        .ok_or_else(|| anyhow!("M1 requires the [transports.tcp] transport to be enabled"))?;
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    let listener = srp_core::transport::tcp_listen(&tcp.bind.to_string()).await?;
-    info!(bind = %tcp.bind, "listening for tunnels on the tcp transport");
+    if let Some(t) = config.transports.tcp.as_ref().filter(|t| t.enabled) {
+        let listener = srp_core::transport::tcp_listen(&t.bind.to_string()).await?;
+        info!(bind = %t.bind, "listening on the tcp transport");
+        let (config, identity) = (config.clone(), identity.clone());
+        tasks.push(tokio::spawn(tcp_accept_loop(
+            listener, config, identity, psk,
+        )));
+    }
 
+    if let Some(t) = config.transports.quic.as_ref().filter(|t| t.enabled) {
+        let listener = QuicListener::bind(t.bind, identity.tls_cert_pem(), identity.tls_key_pem())?;
+        info!(bind = %t.bind, "listening on the quic transport");
+        let (config, identity) = (config.clone(), identity.clone());
+        tasks.push(tokio::spawn(quic_accept_loop(
+            listener, config, identity, psk,
+        )));
+    }
+
+    if let Some(t) = config.transports.wss.as_ref().filter(|t| t.enabled) {
+        let listener =
+            WssListener::bind(t.bind, identity.tls_cert_pem(), identity.tls_key_pem()).await?;
+        info!(bind = %t.bind, path = %t.path, "listening on the wss transport");
+        let (config, identity) = (config.clone(), identity.clone());
+        tasks.push(tokio::spawn(wss_accept_loop(
+            listener, config, identity, psk,
+        )));
+    }
+
+    if tasks.is_empty() {
+        bail!("no transport is enabled — enable at least one of [transports.tcp/quic/wss]");
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    Ok(())
+}
+
+// ── Per-transport accept loops ─────────────────────────────────────────────
+
+async fn tcp_accept_loop(
+    listener: TcpListener,
+    config: Arc<ServerConfig>,
+    identity: Arc<ServerIdentity>,
+    psk: [u8; 32],
+) {
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "accepting a tunnel connection failed");
-                continue;
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                stream.set_nodelay(true).ok();
+                spawn_tunnel("tcp", stream, peer, config.clone(), identity.clone(), psk);
             }
-        };
-        stream.set_nodelay(true).ok();
-        let config = config.clone();
-        let identity = identity.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_tunnel(stream, peer, config, identity, psk).await {
-                warn!(%peer, error = %format!("{e:#}"), "tunnel ended with error");
-            }
-        });
+            Err(e) => warn!(error = %e, "tcp accept failed"),
+        }
     }
 }
 
-/// Handle one client tunnel for its whole lifetime.
-async fn handle_tunnel(
-    stream: TcpStream,
+async fn quic_accept_loop(
+    listener: QuicListener,
+    config: Arc<ServerConfig>,
+    identity: Arc<ServerIdentity>,
+    psk: [u8; 32],
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                spawn_tunnel("quic", stream, peer, config.clone(), identity.clone(), psk)
+            }
+            Err(e) => debug!(error = %format!("{e:#}"), "quic accept failed"),
+        }
+    }
+}
+
+async fn wss_accept_loop(
+    listener: WssListener,
+    config: Arc<ServerConfig>,
+    identity: Arc<ServerIdentity>,
+    psk: [u8; 32],
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                spawn_tunnel("wss", stream, peer, config.clone(), identity.clone(), psk)
+            }
+            Err(e) => debug!(error = %format!("{e:#}"), "wss accept failed"),
+        }
+    }
+}
+
+/// Spawn a tunnel handler for an accepted byte stream of any transport.
+fn spawn_tunnel<S>(
+    transport: &'static str,
+    stream: S,
     peer: SocketAddr,
     config: Arc<ServerConfig>,
     identity: Arc<ServerIdentity>,
     psk: [u8; 32],
-) -> Result<()> {
-    info!(%peer, "tunnel connecting — starting Noise handshake");
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = handle_tunnel(stream, transport, peer, config, identity, psk).await {
+            warn!(transport, %peer, error = %format!("{e:#}"), "tunnel ended with error");
+        }
+    });
+}
+
+/// Handle one client tunnel for its whole lifetime.
+async fn handle_tunnel<S>(
+    stream: S,
+    transport: &'static str,
+    peer: SocketAddr,
+    config: Arc<ServerConfig>,
+    identity: Arc<ServerIdentity>,
+    psk: [u8; 32],
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    info!(transport, %peer, "tunnel connecting — starting Noise handshake");
     let noise = session::accept(stream, identity.noise_private_key(), &psk)
         .await
         .context("noise handshake")?;
@@ -121,7 +206,7 @@ async fn handle_tunnel(
         }
     };
     write_frame(&mut control, &ControlMsg::LoginOk).await?;
-    info!(%peer, user = %user.name, "client authenticated");
+    info!(transport, %peer, user = %user.name, "client authenticated");
 
     // ---- control loop ----
     let mut proxy_tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -168,7 +253,6 @@ async fn handle_tunnel(
         }
     }
 
-    // Tear down the public listeners bound for this tunnel.
     for handle in proxy_tasks {
         handle.abort();
     }
@@ -281,7 +365,6 @@ async fn udp_proxy_loop(socket: Arc<UdpSocket>, mux: Arc<Mux>, proxy: String) {
         };
         let datagram = buf[..n].to_vec();
 
-        // Route to an existing session; recover the datagram if it has exited.
         let datagram = match sessions.get(&src) {
             Some(tx) => match tx.send(datagram) {
                 Ok(()) => continue,

@@ -1,9 +1,11 @@
 //! Relay client: dial the server, register proxies, forward connections.
 //!
-//! The client runs the Noise initiator handshake, wraps the session in yamux,
-//! authenticates on the control substream, and registers each configured
-//! proxy. The server then drives traffic by opening data substreams, which the
-//! client relays to the matching local TCP or UDP service.
+//! The client tries the transports in `transport_priority` order and keeps the
+//! first that connects. Whatever the transport, it then runs the Noise
+//! initiator handshake, wraps the session in yamux, authenticates on the
+//! control substream, and registers each configured proxy. The server drives
+//! traffic by opening data substreams, which the client relays to the matching
+//! local TCP or UDP service.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -21,12 +23,12 @@ use srp_core::proto::{
     read_datagram, read_frame, write_datagram, write_frame, ControlMsg, DataHead,
 };
 use srp_core::session;
-use srp_core::types::{ProxyKind, TransportKind};
+use srp_core::types::TransportKind;
 
-use crate::config::{self, ClientConfig};
+use crate::config::{self, ClientConfig, ClientSection};
 
-/// A UDP session with no traffic from the local service for this long is
-/// dropped (the server enforces the same).
+/// A UDP session idle (no traffic from the local service) for this long is
+/// dropped; the server enforces the same.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
 /// Run the client until the tunnel closes.
@@ -36,30 +38,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let psk = srp_core::crypto::derive_psk(&config.security.server_secret)?;
     let server_pub = identity::decode_noise_public_key(&config.client.server_noise_pubkey)?;
 
-    // M1/M2 support only the tcp transport.
-    if !config
-        .client
-        .transport_priority
-        .contains(&TransportKind::Tcp)
-    {
-        bail!("only the tcp transport is supported so far; add \"tcp\" to transport_priority");
-    }
-    let tcp = config
-        .client
-        .transports
-        .tcp
-        .as_ref()
-        .ok_or_else(|| anyhow!("a [client.transports.tcp] block is required"))?;
-    let addr = format!("{}:{}", config.client.server_host, tcp.port);
-
-    info!(server = %addr, "connecting to the relay server over the tcp transport");
-    let stream = srp_core::transport::tcp_connect(&addr).await?;
-    let noise = session::connect(stream, &server_pub, &psk)
-        .await
-        .context("noise handshake")?;
-    info!("Noise session established");
-
-    let mux = Mux::client(noise);
+    let mut mux = connect_tunnel(&config.client, &psk, &server_pub).await?;
     let mut control = mux.open().await.context("opening control stream")?;
 
     // ---- authenticate ----
@@ -136,7 +115,6 @@ pub async fn run(config_path: &Path) -> Result<()> {
     });
 
     // ---- relay data substreams opened by the server ----
-    let mut mux = mux;
     info!("ready — waiting for proxied connections");
     while let Some(sub) = mux.accept().await {
         let config = config.clone();
@@ -151,6 +129,82 @@ pub async fn run(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Try each transport in `transport_priority` order; keep the first that
+/// establishes a Noise session, returning its multiplexed tunnel.
+async fn connect_tunnel(c: &ClientSection, psk: &[u8; 32], server_pub: &[u8]) -> Result<Mux> {
+    for kind in &c.transport_priority {
+        let attempt = match kind {
+            TransportKind::Tcp => try_tcp(c, psk, server_pub).await,
+            TransportKind::Quic => try_quic(c, psk, server_pub).await,
+            TransportKind::Wss => try_wss(c, psk, server_pub).await,
+        };
+        match attempt {
+            Ok(mux) => {
+                info!(transport = %kind, "tunnel established");
+                return Ok(mux);
+            }
+            Err(e) => {
+                warn!(transport = %kind, error = %format!("{e:#}"), "transport failed, trying next")
+            }
+        }
+    }
+    bail!("every transport in transport_priority failed to connect")
+}
+
+async fn try_tcp(c: &ClientSection, psk: &[u8; 32], server_pub: &[u8]) -> Result<Mux> {
+    let tcp = c
+        .transports
+        .tcp
+        .as_ref()
+        .ok_or_else(|| anyhow!("no [client.transports.tcp] block"))?;
+    let addr = format!("{}:{}", c.server_host, tcp.port);
+    let stream = srp_core::transport::tcp_connect(&addr).await?;
+    let noise = session::connect(stream, server_pub, psk)
+        .await
+        .context("noise handshake")?;
+    Ok(Mux::client(noise))
+}
+
+async fn try_quic(c: &ClientSection, psk: &[u8; 32], server_pub: &[u8]) -> Result<Mux> {
+    let quic = c
+        .transports
+        .quic
+        .as_ref()
+        .ok_or_else(|| anyhow!("no [client.transports.quic] block"))?;
+    let addr = resolve(&c.server_host, quic.port).await?;
+    let stream =
+        srp_core::quic::quic_connect(addr, &c.server_host, &c.server_cert_fingerprint).await?;
+    let noise = session::connect(stream, server_pub, psk)
+        .await
+        .context("noise handshake")?;
+    Ok(Mux::client(noise))
+}
+
+async fn try_wss(c: &ClientSection, psk: &[u8; 32], server_pub: &[u8]) -> Result<Mux> {
+    let wss = c
+        .transports
+        .wss
+        .as_ref()
+        .ok_or_else(|| anyhow!("no [client.transports.wss] block"))?;
+    let addr = resolve(&c.server_host, wss.port).await?;
+    let stream =
+        srp_core::wss::wss_connect(addr, &c.server_host, &wss.path, &c.server_cert_fingerprint)
+            .await?;
+    let noise = session::connect(stream, server_pub, psk)
+        .await
+        .context("noise handshake")?;
+    Ok(Mux::client(noise))
+}
+
+/// Resolve `host:port` to a single socket address.
+async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
+    tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolving {host}:{port}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address found for {host}:{port}"))
+}
+
 /// Relay one server-opened data substream to its local service.
 async fn handle_data(mut sub: Substream, config: Arc<ClientConfig>) -> Result<()> {
     let head: DataHead = read_frame(&mut sub).await.context("reading data head")?;
@@ -162,7 +216,7 @@ async fn handle_data(mut sub: Substream, config: Arc<ClientConfig>) -> Result<()
     let (kind, local_addr) = (proxy.kind, proxy.local_addr);
 
     match kind {
-        ProxyKind::Tcp => {
+        srp_core::types::ProxyKind::Tcp => {
             let mut local = TcpStream::connect(local_addr)
                 .await
                 .with_context(|| format!("connecting to local service {local_addr}"))?;
@@ -172,7 +226,7 @@ async fn handle_data(mut sub: Substream, config: Arc<ClientConfig>) -> Result<()
                 .await
                 .context("relaying tcp data")?;
         }
-        ProxyKind::Udp => {
+        srp_core::types::ProxyKind::Udp => {
             debug!(proxy = %head.proxy, local = %local_addr, "udp session established");
             relay_udp(sub, local_addr).await?;
         }
