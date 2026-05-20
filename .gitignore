@@ -1,5 +1,6 @@
 /target
 /build/dist/
+.DS_Store
 
 # Server runtime state — holds the TLS private key and Noise static key.
 # Never commit this.

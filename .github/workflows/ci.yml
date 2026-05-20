@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── lint + unit tests ─────────────────────────────────────────────────────
+  # ── lint + unit tests: every push and pull request ────────────────────────
   test:
     name: lint & test
     runs-on: ubuntu-latest
@@ -28,10 +28,11 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-  # ── release binaries for each platform ───────────────────────────────────
+  # ── release binaries: only on version tags (v*) ───────────────────────────
   build:
     name: build ${{ matrix.name }}
     needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -63,7 +64,7 @@ jobs:
           name: rs_srp-${{ matrix.name }}
           path: dist/
 
-  # ── publish a GitHub Release on version tags ──────────────────────────────
+  # ── publish a GitHub Release: only on version tags (v*) ───────────────────
   release:
     name: release
     needs: build
