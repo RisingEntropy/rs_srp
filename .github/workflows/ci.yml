@@ -38,27 +38,40 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            ext: ''
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             ext: ''
           - name: macos-aarch64
-            os: macos-latest
+            os: macos-15
+            target: aarch64-apple-darwin
             ext: ''
           - name: windows-x86_64
-            os: windows-latest
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            ext: '.exe'
+          - name: windows-aarch64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
             ext: '.exe'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: build
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --target ${{ matrix.target }}
       - name: stage artifacts
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/rs_srpd${{ matrix.ext }}" dist/
-          cp "target/release/rs_srpc${{ matrix.ext }}" dist/
+          cp "target/${{ matrix.target }}/release/rs_srpd${{ matrix.ext }}" dist/
+          cp "target/${{ matrix.target }}/release/rs_srpc${{ matrix.ext }}" dist/
       - uses: actions/upload-artifact@v4
         with:
           name: rs_srp-${{ matrix.name }}
