@@ -82,8 +82,7 @@ impl ServerIdentity {
     /// SHA-256 fingerprint of the TLS certificate, formatted `sha256:<hex>`.
     /// This is the value a client pins as `server_cert_fingerprint`.
     pub fn cert_fingerprint(&self) -> Result<String> {
-        let der =
-            pem_to_der(&self.tls_cert_pem).context("decoding the stored TLS certificate")?;
+        let der = pem_to_der(&self.tls_cert_pem).context("decoding the stored TLS certificate")?;
         Ok(cert_fingerprint_from_der(&der))
     }
 }
@@ -128,10 +127,10 @@ fn load_or_create_noise(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     let pub_path = state_dir.join(NOISE_PUB_FILE);
 
     if priv_path.exists() && pub_path.exists() {
-        let private = fs::read(&priv_path)
-            .with_context(|| format!("reading {}", priv_path.display()))?;
-        let public = fs::read(&pub_path)
-            .with_context(|| format!("reading {}", pub_path.display()))?;
+        let private =
+            fs::read(&priv_path).with_context(|| format!("reading {}", priv_path.display()))?;
+        let public =
+            fs::read(&pub_path).with_context(|| format!("reading {}", pub_path.display()))?;
         return Ok((private, public));
     }
 

@@ -1,0 +1,52 @@
+# srpd.example.toml — example server configuration for rs_srpd
+#
+# Copy to srpd.toml and edit before running rs_srpd.
+
+# Hostname or IP address advertised to clients via `rs_srpd client-config`.
+# Optional; omit if you prefer to supply it on the command line with --host.
+public_host = "srp.example.com"
+
+# Directory where the server's cryptographic identity (TLS cert + Noise
+# keypair) is persisted.  The directory is created automatically if absent.
+state_dir = "./srpd-state"
+
+# ---------------------------------------------------------------------------
+# Transports
+# ---------------------------------------------------------------------------
+
+[transports.tcp]
+enabled = true
+bind = "0.0.0.0:7100"
+
+[transports.quic]
+enabled = true
+bind = "0.0.0.0:7101"
+
+[transports.wss]
+enabled = true
+bind = "0.0.0.0:7102"
+path = "/srp-tunnel"
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+
+[security]
+# Pre-shared key that every client must know.  Change this before deploying.
+server_secret = "change-me-service-psk"
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+[[users]]
+name = "alice"
+token = "alice-secret-token"
+# Allow Alice to claim remote ports 20000-21000.
+allow_remote_ports = ["20000-21000"]
+
+[[users]]
+name = "bob"
+token = "bob-secret-token"
+# Allow Bob to claim ports 8080 and 22000-22999.
+allow_remote_ports = ["8080", "22000"]
