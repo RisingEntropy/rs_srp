@@ -18,10 +18,12 @@
   .card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase;
              letter-spacing: .06em; color: #8b949e; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #232a33; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #232a33;
+           vertical-align: top; }
   th { color: #8b949e; font-weight: 600; font-size: 12px; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  code { background: #0e1116; padding: 1px 5px; border-radius: 4px; color: #9ecbff; }
+  code { background: #0e1116; padding: 1px 5px; border-radius: 4px; color: #9ecbff;
+         word-break: break-all; }
   .kv { display: grid; grid-template-columns: 160px 1fr; gap: 4px 12px; }
   .kv div:nth-child(odd) { color: #8b949e; }
   .muted { color: #6b7480; }
@@ -32,13 +34,19 @@
   button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
   input { background: #0e1116; border: 1px solid #3a424d; border-radius: 6px;
           color: #d6dde6; padding: 5px 8px; font-size: 13px; }
-  pre { background: #0e1116; border: 1px solid #2a3038; border-radius: 6px;
-        padding: 12px; overflow: auto; font-size: 12px; max-height: 320px; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   canvas { width: 100%; height: 160px; display: block; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .legend { font-size: 12px; }
   .legend b.in { color: #4da3ff; } .legend b.out { color: #5ad18a; }
   .err { color: #ff9b9b; font-size: 13px; }
+  .ok { color: #5ad18a; font-size: 13px; }
+  /* user-management section */
+  #users-card { border-color: #2f3b4d; }
+  .user-form { background: #0e1116; border: 1px solid #2a3038; border-radius: 6px;
+               padding: 12px; margin-bottom: 12px; }
+  .user-form .row { margin-bottom: 8px; }
+  .user-form .row:last-child { margin-bottom: 0; }
+  .field-label { color: #8b949e; font-size: 12px; margin-right: 2px; }
 </style>
 </head>
 <body>
@@ -63,36 +71,37 @@
     </tr></thead><tbody id="tunnels"></tbody></table>
   </div>
 
-  <div class="card">
+  <!-- ── dedicated user-management section ─────────────────────────────── -->
+  <div class="card" id="users-card">
     <h2>Users</h2>
-    <table><thead><tr>
-      <th>Name</th><th>Token</th><th>Allowed remote ports</th><th></th>
-    </tr></thead><tbody id="users"></tbody></table>
-    <div class="row" style="margin-top:12px">
-      <input id="u-name" placeholder="name" size="10">
-      <input id="u-token" placeholder="token" size="16">
-      <input id="u-ports" placeholder="ports e.g. 20000-21000,8080" size="26">
-      <button class="primary" onclick="saveUser()">Add / update</button>
-      <span class="err" id="u-err"></span>
-    </div>
-    <p class="muted" style="margin-bottom:0">Editing a user rewrites the server
-      config and hot-reloads it; changes apply to new tunnels.</p>
-  </div>
 
-  <div class="card">
-    <h2>Client configuration</h2>
-    <div class="row">
-      <input id="cc-user" placeholder="user name" size="12">
-      <input id="cc-host" placeholder="public host (optional)" size="22">
-      <button onclick="genConfig()">Generate srpc.toml</button>
-      <button onclick="copyConfig()">Copy</button>
+    <div class="user-form">
+      <div class="row">
+        <span class="field-label">name</span>
+        <input id="u-name" placeholder="user name" size="14">
+        <span class="field-label">token</span>
+        <input id="u-token" placeholder="token (type one, or generate)" size="30">
+        <button onclick="genToken()" title="fill with a random token">🎲 generate</button>
+      </div>
+      <div class="row">
+        <span class="field-label">allowed remote ports</span>
+        <input id="u-ports" placeholder="e.g. 20000-21000, 8080" size="32">
+        <button class="primary" onclick="saveUser()">Save user</button>
+        <button onclick="resetForm()">Clear</button>
+      </div>
+      <div id="u-msg" class="muted">Add a user, or pick one below to edit.</div>
     </div>
-    <pre id="cc-out" style="margin-bottom:0">Pick a user and generate its config.</pre>
+
+    <table><thead><tr>
+      <th>Name</th><th>Token</th><th>Allowed remote ports</th><th>Actions</th>
+    </tr></thead><tbody id="users"></tbody></table>
   </div>
 
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt = n => {
   const u = ['B','KB','MB','GB','TB']; let i = 0; n = Number(n);
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
@@ -100,30 +109,30 @@ const fmt = n => {
 };
 const dur = s => {
   s = Number(s);
-  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600),
-        m = Math.floor(s%3600/60);
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   if (d) return `${d}d ${h}h`;
   if (h) return `${h}h ${m}m`;
   if (m) return `${m}m ${s%60}s`;
   return `${s}s`;
 };
 
+// ── overview / tunnels / chart ────────────────────────────────────────────
 async function refresh() {
   try {
     const ov = await (await fetch('api/overview')).json();
     renderServer(ov);
     renderTunnels(ov.tunnels);
-    const hist = await (await fetch('api/history')).json();
-    drawChart(hist);
+    drawChart(await (await fetch('api/history')).json());
   } catch (e) { /* server momentarily unreachable */ }
 }
 
 function renderServer(ov) {
-  const t = ov.transports.map(x => `<code>${x.kind} ${x.bind}</code>`).join(' ') || '<span class="muted">none</span>';
+  const t = ov.transports.map(x => `<code>${esc(x.kind)} ${esc(x.bind)}</code>`).join(' ')
+            || '<span class="muted">none</span>';
   $('server').innerHTML = `
-    <div>public host</div><div>${ov.public_host || '<span class="muted">not set</span>'}</div>
-    <div>noise pubkey</div><div><code>${ov.noise_pubkey}</code></div>
-    <div>cert fingerprint</div><div><code>${ov.cert_fingerprint}</code></div>
+    <div>public host</div><div>${esc(ov.public_host || '') || '<span class="muted">not set</span>'}</div>
+    <div>noise pubkey</div><div><code>${esc(ov.noise_pubkey)}</code></div>
+    <div>cert fingerprint</div><div><code>${esc(ov.cert_fingerprint)}</code></div>
     <div>transports</div><div>${t}</div>
     <div>users / tunnels</div><div>${ov.user_count} configured &middot; ${ov.tunnels.length} online</div>`;
 }
@@ -132,15 +141,15 @@ function renderTunnels(tunnels) {
   const rows = [];
   for (const t of tunnels) {
     if (!t.proxies.length) {
-      rows.push(`<tr><td>#${t.id}</td><td>${t.user}</td><td><code>${t.transport}</code> ${t.peer}</td>
+      rows.push(`<tr><td>#${t.id}</td><td>${esc(t.user)}</td><td><code>${esc(t.transport)}</code> ${esc(t.peer)}</td>
         <td colspan="6" class="muted">no proxies &middot; up ${dur(t.uptime_secs)}</td></tr>`);
       continue;
     }
     t.proxies.forEach((p, i) => {
       const head = i === 0
-        ? `<td>#${t.id}</td><td>${t.user}</td><td><code>${t.transport}</code><br><span class="muted">up ${dur(t.uptime_secs)}</span></td>`
+        ? `<td>#${t.id}</td><td>${esc(t.user)}</td><td><code>${esc(t.transport)}</code><br><span class="muted">up ${dur(t.uptime_secs)}</span></td>`
         : `<td></td><td></td><td></td>`;
-      rows.push(`<tr>${head}<td>${p.name} <span class="muted">(${p.kind})</span></td>
+      rows.push(`<tr>${head}<td>${esc(p.name)} <span class="muted">(${esc(p.kind)})</span></td>
         <td><code>:${p.remote_port}</code></td>
         <td class="num">${fmt(p.bytes_in)}</td><td class="num">${fmt(p.bytes_out)}</td>
         <td class="num">${p.conns}</td><td class="num">${p.active}</td></tr>`);
@@ -151,19 +160,15 @@ function renderTunnels(tunnels) {
 }
 
 function drawChart(hist) {
-  const c = $('chart'), ctx = c.getContext('2d');
-  const W = c.width, H = c.height;
+  const c = $('chart'), ctx = c.getContext('2d'), W = c.width, H = c.height;
   ctx.clearRect(0, 0, W, H);
-  // cumulative totals -> per-second rates
   const ins = [], outs = [];
   for (let i = 1; i < hist.length; i++) {
     const dt = Math.max(1, hist[i].t - hist[i-1].t);
-    ins.push(Math.max(0, (hist[i].total_in  - hist[i-1].total_in )) / dt);
-    outs.push(Math.max(0, (hist[i].total_out - hist[i-1].total_out)) / dt);
+    ins.push(Math.max(0, hist[i].total_in  - hist[i-1].total_in ) / dt);
+    outs.push(Math.max(0, hist[i].total_out - hist[i-1].total_out) / dt);
   }
-  if (!ins.length) {
-    ctx.fillStyle = '#6b7480'; ctx.fillText('collecting samples…', 10, 20); return;
-  }
+  if (!ins.length) { ctx.fillStyle = '#6b7480'; ctx.fillText('collecting samples…', 10, 20); return; }
   const max = Math.max(1, ...ins, ...outs);
   const line = (data, color) => {
     ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
@@ -174,51 +179,93 @@ function drawChart(hist) {
     });
     ctx.stroke();
   };
-  ctx.fillStyle = '#6b7480';
-  ctx.fillText(fmt(max) + '/s', 6, 12);
-  line(ins, '#4da3ff');
-  line(outs, '#5ad18a');
+  ctx.fillStyle = '#6b7480'; ctx.fillText(fmt(max) + '/s', 6, 12);
+  line(ins, '#4da3ff'); line(outs, '#5ad18a');
+}
+
+// ── user management ───────────────────────────────────────────────────────
+let usersCache = [];
+
+function msg(text, isErr) {
+  const m = $('u-msg');
+  m.textContent = text;
+  m.className = isErr ? 'err' : (isErr === false ? 'ok' : 'muted');
+}
+
+function genToken() {
+  const b = new Uint8Array(24);
+  crypto.getRandomValues(b);
+  $('u-token').value = btoa(String.fromCharCode(...b));
+  msg('random token generated — Save user to apply', false);
+}
+
+function resetForm() {
+  $('u-name').value = $('u-token').value = $('u-ports').value = '';
+  msg('Add a user, or pick one below to edit.');
 }
 
 async function loadUsers() {
-  const users = await (await fetch('api/users')).json();
-  $('users').innerHTML = users.map(u => `<tr>
-      <td>${u.name}</td><td><code>${u.token}</code></td>
-      <td>${u.allow_remote_ports.join(', ') || '<span class="muted">none</span>'}</td>
-      <td><button class="danger" onclick="delUser('${u.name}')">delete</button></td>
-    </tr>`).join('') || '<tr><td colspan="4" class="muted">no users</td></tr>';
+  try {
+    usersCache = await (await fetch('api/users')).json();
+  } catch (e) { return; }
+  $('users').innerHTML = usersCache.map((u, i) => `<tr>
+      <td>${esc(u.name)}</td>
+      <td><code>${esc(u.token)}</code></td>
+      <td>${u.allow_remote_ports.map(esc).join(', ') || '<span class="muted">none</span>'}</td>
+      <td><div class="row">
+        <button onclick="editUser(${i})">edit</button>
+        <button onclick="copyConfig(${i})">copy config</button>
+        <button class="danger" onclick="delUser(${i})">delete</button>
+      </div></td>
+    </tr>`).join('') || '<tr><td colspan="4" class="muted">no users yet</td></tr>';
+}
+
+function editUser(i) {
+  const u = usersCache[i];
+  $('u-name').value = u.name;
+  $('u-token').value = u.token;
+  $('u-ports').value = u.allow_remote_ports.join(', ');
+  msg(`editing "${u.name}" — change fields and Save user`);
 }
 
 async function saveUser() {
-  $('u-err').textContent = '';
   const ports = $('u-ports').value.split(',').map(s => s.trim()).filter(Boolean);
   const body = { name: $('u-name').value.trim(), token: $('u-token').value.trim(),
                  allow_remote_ports: ports };
+  if (!body.name) { msg('user name is required', true); return; }
+  if (!body.token) { msg('token is required — type one or click generate', true); return; }
   const r = await fetch('api/users', { method: 'POST',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   if (r.ok) {
-    $('u-name').value = $('u-token').value = $('u-ports').value = '';
+    msg(`user "${body.name}" saved`, false);
+    resetForm();
     loadUsers(); refresh();
-  } else { $('u-err').textContent = await r.text(); }
+  } else {
+    msg('error: ' + await r.text(), true);
+  }
 }
 
-async function delUser(name) {
-  if (!confirm('Delete user ' + name + '?')) return;
-  await fetch('api/users/' + encodeURIComponent(name), { method: 'DELETE' });
-  loadUsers(); refresh();
+async function delUser(i) {
+  const u = usersCache[i];
+  if (!confirm(`Delete user "${u.name}"?`)) return;
+  const r = await fetch('api/users/' + encodeURIComponent(u.name), { method: 'DELETE' });
+  if (r.ok) { msg(`user "${u.name}" deleted`, false); loadUsers(); refresh(); }
+  else { msg('error: ' + await r.text(), true); }
 }
 
-async function genConfig() {
-  const user = $('cc-user').value.trim();
-  if (!user) { $('cc-out').textContent = 'enter a user name'; return; }
-  let url = 'api/client-config?user=' + encodeURIComponent(user);
-  const host = $('cc-host').value.trim();
-  if (host) url += '&host=' + encodeURIComponent(host);
-  const r = await fetch(url);
-  $('cc-out').textContent = await r.text();
+async function copyConfig(i) {
+  const u = usersCache[i];
+  const r = await fetch('api/client-config?user=' + encodeURIComponent(u.name));
+  const text = await r.text();
+  if (!r.ok) { msg('error: ' + text, true); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    msg(`srpc.toml for "${u.name}" copied to clipboard`, false);
+  } catch (e) {
+    console.log(text);
+    msg(`clipboard unavailable — config for "${u.name}" logged to the browser console`, true);
+  }
 }
-
-function copyConfig() { navigator.clipboard.writeText($('cc-out').textContent); }
 
 refresh(); loadUsers();
 setInterval(refresh, 3000);
