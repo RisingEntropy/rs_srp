@@ -100,6 +100,14 @@ pub fn cert_fingerprint_from_der(der: &[u8]) -> String {
     out
 }
 
+/// Decode a base64-encoded Noise public key — the `server_noise_pubkey` value
+/// a client pins in its config.
+pub fn decode_noise_public_key(b64: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .context("base64-decoding Noise public key")
+}
+
 fn load_or_create_tls(state_dir: &Path) -> Result<(String, String)> {
     let cert_path = state_dir.join(TLS_CERT_FILE);
     let key_path = state_dir.join(TLS_KEY_FILE);
