@@ -21,6 +21,10 @@ A NAT-traversal reverse proxy (FRP-style relay model) written in Rust.
 
 ## Status
 
-Milestone **M0**: workspace skeleton, configuration parsing, CLI, logging,
-persisted server identity (self-signed cert + Noise keypair), and the
-`client-config` helper command. Networking arrives in M1.
+Milestone **M1** complete: a working TCP-transport tunnel. The client dials the
+server, both run a Noise `NKpsk0` handshake, multiplex with yamux, authenticate
+on a control substream, and forward TCP services end-to-end through the
+encrypted tunnel.
+
+Next: M2 (multi-user enforcement, UDP forwarding), M3 (QUIC + WSS transports
+with priority fallback), M4 (heartbeat, reconnect, polish).
