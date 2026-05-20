@@ -88,3 +88,44 @@ where
     r.read_exact(&mut buf).await.context("reading frame body")?;
     postcard::from_bytes(&buf).context("deserializing control frame")
 }
+
+/// Largest datagram payload that may be framed. UDP datagrams stay well under
+/// this; the limit only guards against a corrupt length prefix.
+const MAX_DATAGRAM: usize = 64 * 1024;
+
+/// Write a raw datagram, length-prefixed with a big-endian `u32`.
+///
+/// A data substream serving a UDP proxy carries one framed datagram per call,
+/// so packet boundaries survive the byte-stream tunnel.
+pub async fn write_datagram<W>(w: &mut W, data: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if data.len() > MAX_DATAGRAM {
+        bail!("datagram too large: {} bytes", data.len());
+    }
+    w.write_all(&(data.len() as u32).to_be_bytes()).await?;
+    w.write_all(data).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Read one length-prefixed datagram written by [`write_datagram`].
+pub async fn read_datagram<R>(r: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)
+        .await
+        .context("reading datagram length")?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_DATAGRAM {
+        bail!("datagram too large: {len} bytes");
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)
+        .await
+        .context("reading datagram body")?;
+    Ok(buf)
+}
