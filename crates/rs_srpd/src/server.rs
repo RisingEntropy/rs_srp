@@ -38,6 +38,10 @@ const UDP_IDLE: Duration = Duration::from_secs(60);
 /// Receive buffer large enough for any UDP datagram.
 const UDP_BUF: usize = 64 * 1024;
 
+/// No control-stream activity for this long means the client is gone. Clients
+/// send a keep-alive `Ping` every 15s, so this is a generous 3× margin.
+const CONTROL_IDLE: Duration = Duration::from_secs(45);
+
 /// Run the relay server until interrupted.
 pub async fn run(config_path: &Path) -> Result<()> {
     let config = Arc::new(config::load(config_path)?);
@@ -211,10 +215,14 @@ where
     // ---- control loop ----
     let mut proxy_tasks: Vec<JoinHandle<()>> = Vec::new();
     loop {
-        let msg: ControlMsg = match read_frame(&mut control).await {
-            Ok(m) => m,
-            Err(_) => {
+        let msg: ControlMsg = match timeout(CONTROL_IDLE, read_frame(&mut control)).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(_)) => {
                 info!(%peer, user = %user.name, "control stream closed");
+                break;
+            }
+            Err(_) => {
+                warn!(%peer, user = %user.name, "client heartbeat timed out");
                 break;
             }
         };

@@ -1,20 +1,22 @@
 //! Relay client: dial the server, register proxies, forward connections.
 //!
 //! The client tries the transports in `transport_priority` order and keeps the
-//! first that connects. Whatever the transport, it then runs the Noise
-//! initiator handshake, wraps the session in yamux, authenticates on the
-//! control substream, and registers each configured proxy. The server drives
-//! traffic by opening data substreams, which the client relays to the matching
-//! local TCP or UDP service.
+//! first that connects. It then runs the Noise initiator handshake, multiplexes
+//! with yamux, authenticates on the control substream, and registers each
+//! configured proxy. A heartbeat detects a silently-dead tunnel; when a session
+//! ends the client reconnects with exponential backoff — re-running the
+//! transport fallback, so it recovers onto whichever transport still works.
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{copy_bidirectional, split, ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::{timeout, Duration};
+use tokio::sync::Notify;
+use tokio::time::{interval, timeout, Duration};
 use tracing::{debug, info, warn};
 
 use srp_core::identity;
@@ -23,22 +25,48 @@ use srp_core::proto::{
     read_datagram, read_frame, write_datagram, write_frame, ControlMsg, DataHead,
 };
 use srp_core::session;
-use srp_core::types::TransportKind;
+use srp_core::types::{ProxyKind, TransportKind};
 
 use crate::config::{self, ClientConfig, ClientSection};
 
-/// A UDP session idle (no traffic from the local service) for this long is
-/// dropped; the server enforces the same.
+/// A UDP session idle (no traffic from the local service) this long is dropped.
 const UDP_IDLE: Duration = Duration::from_secs(60);
+/// How often the client sends a keep-alive `Ping`.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// No `Pong` for this long means the tunnel is dead.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+/// Reconnect backoff bounds.
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// Run the client until the tunnel closes.
+/// Run the client: connect, serve, and reconnect for as long as the process
+/// lives.
 pub async fn run(config_path: &Path) -> Result<()> {
     let config = Arc::new(config::load(config_path)?);
-
     let psk = srp_core::crypto::derive_psk(&config.security.server_secret)?;
     let server_pub = identity::decode_noise_public_key(&config.client.server_noise_pubkey)?;
 
-    let mut mux = connect_tunnel(&config.client, &psk, &server_pub).await?;
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        let started = Instant::now();
+        match run_session(&config, &psk, &server_pub).await {
+            Ok(()) => info!("tunnel closed"),
+            Err(e) => warn!(error = %format!("{e:#}"), "tunnel session ended"),
+        }
+        // A session with real uptime resets the backoff.
+        if started.elapsed() > Duration::from_secs(30) {
+            backoff = RECONNECT_MIN;
+        }
+        let wait = backoff + jitter();
+        info!(seconds = wait.as_secs_f64(), "reconnecting after backoff");
+        tokio::time::sleep(wait).await;
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+}
+
+/// One tunnel session: connect, register, serve until the tunnel ends.
+async fn run_session(config: &Arc<ClientConfig>, psk: &[u8; 32], server_pub: &[u8]) -> Result<()> {
+    let mut mux = connect_tunnel(&config.client, psk, server_pub).await?;
     let mut control = mux.open().await.context("opening control stream")?;
 
     // ---- authenticate ----
@@ -95,27 +123,27 @@ pub async fn run(config_path: &Path) -> Result<()> {
         "proxy registration complete"
     );
 
-    // ---- keep the control stream drained (answer keep-alive pings) ----
-    tokio::spawn(async move {
-        loop {
-            let msg: Result<ControlMsg> = read_frame(&mut control).await;
-            match msg {
-                Ok(ControlMsg::Ping) => {
-                    if write_frame(&mut control, &ControlMsg::Pong).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    debug!("control stream closed");
-                    break;
-                }
-            }
-        }
-    });
+    // ---- heartbeat + data relay ----
+    let (control_r, control_w) = split(control);
+    let dead = Arc::new(Notify::new());
+    let last_pong = Arc::new(Mutex::new(Instant::now()));
 
-    // ---- relay data substreams opened by the server ----
+    let reader = tokio::spawn(control_reader(control_r, last_pong.clone(), dead.clone()));
+    let beat = tokio::spawn(heartbeat(control_w, last_pong, dead.clone()));
+
     info!("ready — waiting for proxied connections");
+    tokio::select! {
+        _ = accept_data(&mut mux, config.clone()) => info!("tunnel closed by the server"),
+        _ = dead.notified() => warn!("tunnel unresponsive — heartbeat timeout"),
+    }
+
+    reader.abort();
+    beat.abort();
+    Ok(())
+}
+
+/// Accept and relay data substreams the server opens.
+async fn accept_data(mux: &mut Mux, config: Arc<ClientConfig>) {
     while let Some(sub) = mux.accept().await {
         let config = config.clone();
         tokio::spawn(async move {
@@ -124,10 +152,62 @@ pub async fn run(config_path: &Path) -> Result<()> {
             }
         });
     }
-
-    info!("tunnel closed by the server");
-    Ok(())
 }
+
+/// Drain the control stream, recording keep-alive `Pong`s.
+async fn control_reader(
+    mut control: ReadHalf<Substream>,
+    last_pong: Arc<Mutex<Instant>>,
+    dead: Arc<Notify>,
+) {
+    loop {
+        let msg: Result<ControlMsg> = read_frame(&mut control).await;
+        match msg {
+            Ok(ControlMsg::Pong) => *last_pong.lock().unwrap() = Instant::now(),
+            Ok(_) => {}
+            Err(_) => {
+                dead.notify_one();
+                break;
+            }
+        }
+    }
+}
+
+/// Send periodic `Ping`s and declare the tunnel dead if `Pong`s stop arriving.
+async fn heartbeat(
+    mut control: WriteHalf<Substream>,
+    last_pong: Arc<Mutex<Instant>>,
+    dead: Arc<Notify>,
+) {
+    let mut ticker = interval(HEARTBEAT_INTERVAL);
+    loop {
+        ticker.tick().await;
+        if write_frame(&mut control, &ControlMsg::Ping).await.is_err() {
+            dead.notify_one();
+            break;
+        }
+        let stale = last_pong.lock().unwrap().elapsed();
+        if stale > HEARTBEAT_TIMEOUT {
+            warn!(
+                seconds = stale.as_secs(),
+                "no heartbeat response from server"
+            );
+            dead.notify_one();
+            break;
+        }
+    }
+}
+
+/// Sub-second jitter so reconnecting clients do not synchronize.
+fn jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis((nanos % 1000) as u64)
+}
+
+// ── Transport selection ────────────────────────────────────────────────────
 
 /// Try each transport in `transport_priority` order; keep the first that
 /// establishes a Noise session, returning its multiplexed tunnel.
@@ -205,6 +285,8 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("no address found for {host}:{port}"))
 }
 
+// ── Data relay ─────────────────────────────────────────────────────────────
+
 /// Relay one server-opened data substream to its local service.
 async fn handle_data(mut sub: Substream, config: Arc<ClientConfig>) -> Result<()> {
     let head: DataHead = read_frame(&mut sub).await.context("reading data head")?;
@@ -216,7 +298,7 @@ async fn handle_data(mut sub: Substream, config: Arc<ClientConfig>) -> Result<()
     let (kind, local_addr) = (proxy.kind, proxy.local_addr);
 
     match kind {
-        srp_core::types::ProxyKind::Tcp => {
+        ProxyKind::Tcp => {
             let mut local = TcpStream::connect(local_addr)
                 .await
                 .with_context(|| format!("connecting to local service {local_addr}"))?;
@@ -226,7 +308,7 @@ async fn handle_data(mut sub: Substream, config: Arc<ClientConfig>) -> Result<()
                 .await
                 .context("relaying tcp data")?;
         }
-        srp_core::types::ProxyKind::Udp => {
+        ProxyKind::Udp => {
             debug!(proxy = %head.proxy, local = %local_addr, "udp session established");
             relay_udp(sub, local_addr).await?;
         }
