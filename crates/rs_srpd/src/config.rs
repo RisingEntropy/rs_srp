@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Hostname advertised to clients via `client-config`. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_host: Option<String>,
     /// Directory where the server's cryptographic identity is persisted.
     pub state_dir: PathBuf,
@@ -21,13 +22,19 @@ pub struct ServerConfig {
     pub security: Security,
     #[serde(default)]
     pub users: Vec<User>,
+    /// Operations dashboard. Defaults to enabled on 127.0.0.1:1564.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transports {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<TransportListener>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic: Option<TransportListener>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wss: Option<WssListener>,
 }
 
@@ -62,6 +69,31 @@ pub struct User {
     pub token: String,
     #[serde(default)]
     pub allow_remote_ports: Vec<String>,
+}
+
+/// Operations dashboard configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Address the dashboard HTTP server binds. Default 127.0.0.1:1564 —
+    /// loopback-only, so remote access goes through an SSH tunnel.
+    #[serde(default = "default_dashboard_bind")]
+    pub bind: SocketAddr,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        DashboardConfig {
+            enabled: true,
+            bind: default_dashboard_bind(),
+        }
+    }
+}
+
+fn default_dashboard_bind() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 1564))
 }
 
 fn default_true() -> bool {

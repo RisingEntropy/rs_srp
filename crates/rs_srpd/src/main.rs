@@ -1,11 +1,13 @@
 //! rs_srpd — the SRP relay server binary.
 //!
-//! Subcommands: `run` (start the relay) and `client-config` (emit a client
-//! configuration). See the `cli` module for argument definitions.
+//! Subcommands: `run` (start the relay + dashboard) and `client-config` (emit
+//! a client configuration). See the `cli` module for argument definitions.
 
 mod cli;
 mod client_config;
 mod config;
+mod dashboard;
+mod metrics;
 mod server;
 
 use anyhow::Result;

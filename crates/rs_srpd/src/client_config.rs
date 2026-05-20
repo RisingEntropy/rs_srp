@@ -14,7 +14,11 @@ pub fn run(cfg: &ServerConfig, user_name: Option<&str>, host_override: Option<&s
         .map_err(|e| e.context("loading/creating server identity"))?;
 
     match user_name {
-        Some(name) => print_srpc_toml(cfg, &identity, name, host_override),
+        Some(name) => {
+            let toml = render_srpc_toml(cfg, &identity, name, host_override)?;
+            print!("{toml}");
+            Ok(())
+        }
         None => print_identity_card(cfg, &identity),
     }
 }
@@ -23,12 +27,14 @@ pub fn run(cfg: &ServerConfig, user_name: Option<&str>, host_override: Option<&s
 // Full srpc.toml output
 // ---------------------------------------------------------------------------
 
-fn print_srpc_toml(
+/// Render a full `srpc.toml` for `user_name` as a string (shared by the
+/// `client-config` command and the dashboard API).
+pub fn render_srpc_toml(
     cfg: &ServerConfig,
     identity: &ServerIdentity,
     user_name: &str,
     host_override: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     // Find user entry.
     let user = cfg.users.iter().find(|u| u.name == user_name);
     let user = match user {
@@ -154,8 +160,7 @@ fn print_srpc_toml(
     out.push_str("local_addr = \"127.0.0.1:22\"\n");
     out.push_str("remote_port = 20022\n");
 
-    print!("{out}");
-    Ok(())
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
