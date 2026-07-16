@@ -40,10 +40,15 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            # Pin the glibc symbol floor via zig so the binary runs on older
+            # distros (Ubuntu 20.04/22.04, …) instead of demanding the runner's
+            # much newer glibc. Matches build/build.sh.
+            glibc: '2.31'
             ext: ''
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            glibc: '2.31'
             ext: ''
           - name: macos-aarch64
             os: macos-15
@@ -64,8 +69,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # zig + cargo-zigbuild: only for the glibc-pinned Linux builds
+      - name: install zig
+        if: matrix.glibc != ''
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: install cargo-zigbuild
+        if: matrix.glibc != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
       - name: build
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.glibc }}" ]; then
+            cargo zigbuild --release --workspace --target "${{ matrix.target }}.${{ matrix.glibc }}"
+          else
+            cargo build --release --workspace --target "${{ matrix.target }}"
+          fi
       - name: stage artifacts
         shell: bash
         run: |
